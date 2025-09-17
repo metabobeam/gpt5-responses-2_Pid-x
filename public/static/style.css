@@ -1,0 +1,16 @@
+/* Markdown 基本 */
+.markdown { line-height: 1.7; word-break: break-word; }
+.markdown h1, .markdown h2, .markdown h3 { font-weight: 700; margin: 1rem 0 .5rem; }
+.markdown p { margin: .5rem 0; }
+
+/* 表 */
+.markdown table { border-collapse: collapse; width: 100%; }
+.markdown th, .markdown td { border: 1px solid #e5e7eb; padding: .5rem .75rem; vertical-align: top; }
+.markdown thead th { background: #f9fafb; font-weight: 600; }
+
+/* コード */
+.markdown pre { overflow: auto; padding: .75rem; border: 1px solid #e5e7eb; border-radius: .5rem; }
+.markdown code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+
+/* 親の whitespace:pre-wrap 等の影響を打ち消す */
+.markdown, .markdown * { white-space: normal; }
