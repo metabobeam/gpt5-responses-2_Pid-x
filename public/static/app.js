@@ -59,6 +59,7 @@ class ChatBot {
         this.currentFile = null
         this.currentFileContent = null
         this.currentFileIds = [] // Store file IDs for proper file handling
+        this.previousResponseId = null // For conversation continuity
         
         // Thread management
         this.currentThreadId = null
@@ -213,6 +214,7 @@ class ChatBot {
     clearCurrentThread() {
         if (this.currentThreadId) {
             this.messages = []
+            this.previousResponseId = null // Reset conversation continuity
             this.updateChatDisplay()
             this.saveCurrentThread()
             this.showStatus('現在のスレッドがクリアされました')
@@ -245,7 +247,8 @@ class ChatBot {
                 useSearch: this.useSearch,
                 fileContent: this.currentFileContent,
                 fileIds: this.currentFileIds || [], // 確実に配列として送信
-                model: 'gpt-5' // GPT-5のみ使用（フォールバックなし）
+                model: 'gpt-5', // GPT-5のみ使用（フォールバックなし）
+                previousResponseId: this.previousResponseId // 会話継続用
             }
             
             console.log('[SEND] ★ Final payload fileIds:', requestData.fileIds)
@@ -273,6 +276,12 @@ class ChatBot {
                 setTimeout(() => {
                     statusInfo.push(`添付認識: ${responseData.attachmentsSeen}件`)
                 }, 1000)
+            }
+            
+            // Store responseId for next request (conversation continuity)
+            if (responseData.responseId) {
+                this.previousResponseId = responseData.responseId
+                console.log('[FRONTEND] Stored responseId for continuity:', this.previousResponseId)
             }
             
             // Update API status with diagnostic information

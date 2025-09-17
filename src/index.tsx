@@ -312,10 +312,13 @@ function detectSearchUsed(res: any) {
                     it?.type === 'web_search_call' ||
                     it?.type === 'web_search'
     
-    // Also check for annotations which indicate search results
-    const hasAnnotations = it?.type === 'message' && 
-                          Array.isArray(it?.content) &&
-                          it.content.some((c: any) => Array.isArray(c?.annotations) && c.annotations.length > 0)
+    // Also check for annotations/citations which indicate search results
+    const hasAnnotations = it?.type === 'message' &&
+      Array.isArray(it?.content) &&
+      it.content.some((c: any) =>
+        (Array.isArray(c?.annotations) && c.annotations.length > 0) ||
+        (Array.isArray(c?.citations) && c.citations.length > 0)
+      )
     
     console.log(`[SEARCH_DETECT] Item ${index}: type="${it?.type}", tool="${it?.tool}", isSearch=${isSearch}, hasAnnotations=${hasAnnotations}`)
     
@@ -331,7 +334,8 @@ function detectSearchUsed(res: any) {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-// Enable CORS for all routes
+// Enable CORS - TODO: 本番環境では特定のオリジンに制限する
+// app.use('*', cors({ origin: ['https://your-production-domain.com'] }))
 app.use('*', cors())
 
 // Single model execution function with GPT-5 optimizations
@@ -339,7 +343,8 @@ async function callOnceWithModel(
   openaiKey: string, 
   model: string, 
   inputMessages: any[], 
-  tools: any[] = []
+  tools: any[] = [],
+  previousResponseId: string | null = null
 ): Promise<{ result: any; partial: boolean; error?: string }> {
   console.log(`[CALL_MODEL] Attempting with model: ${model}`)
   
@@ -350,14 +355,16 @@ async function callOnceWithModel(
     tool_choice: 'auto'
   }
   
+  // Add previous_response_id if provided for conversation continuity
+  if (previousResponseId) {
+    responsesData.previous_response_id = previousResponseId
+  }
+  
   // Model-specific optimizations with increased token limits to prevent premature truncation
   if (model === 'gpt-5') {
     // GPT-5 specific settings for Responses API
     responsesData.max_output_tokens = 12000  // Responses API uses max_output_tokens
-    // Note: reasoning.effort 'minimal' cannot be used with web_search tool
-    if (tools.length === 0 || !tools.some(t => t.type === 'web_search')) {
-      responsesData.reasoning = { effort: 'minimal' }
-    }
+    responsesData.reasoning = { effort: 'low' }  // Use low/medium/high (minimal is invalid)
   } else if (model === 'gpt-4o') {
     responsesData.max_output_tokens = 12000  // High capacity models
   } else if (model === 'gpt-4o-mini' || model === 'gpt-5-mini') {
@@ -379,7 +386,8 @@ async function callOnceWithModel(
     model: responsesData.model,
     max_output_tokens: responsesData.max_output_tokens,
     reasoning: responsesData.reasoning,
-    tools_count: tools.length
+    tools_count: tools.length,
+    has_previous_response: !!previousResponseId
   })
   
   try {
@@ -424,7 +432,8 @@ async function callWithGPT5Only(
   openaiKey: string,
   model: string,
   inputMessages: any[],
-  tools: any[] = []
+  tools: any[] = [],
+  previousResponseId: string | null = null
 ): Promise<{ result: any; partial: boolean; modelUsed: string; modelsTried: string[]; error?: string }> {
   
   const modelsTried: string[] = []
@@ -448,7 +457,8 @@ async function callWithGPT5Only(
     openaiKey, 
     'gpt-5', 
     inputMessages, 
-    tools
+    tools,
+    previousResponseId
   )
   
   if (result && !error) {
@@ -474,10 +484,86 @@ async function callWithGPT5Only(
 // Serve static files
 app.use('/static/*', serveStatic({ root: './public' }))
 
+// Streaming chat endpoint for real-time responses
+app.post('/api/chat/stream', async (c) => {
+  try {
+    const { message, model = 'gpt-5', useSearch = false, previousResponseId = null } = await c.req.json()
+    const openaiKey = c.env.OPENAI_API_KEY
+    
+    if (!openaiKey) {
+      return c.json({ error: 'OpenAI API key not configured' }, 400)
+    }
+    
+    // Only accept GPT-5 for streaming as well
+    if (model !== 'gpt-5') {
+      return c.json({ 
+        error: 'Only GPT-5 model is allowed for streaming', 
+        details: `Requested model '${model}' is not supported.` 
+      }, 400)
+    }
+    
+    const tools = useSearch ? [{ type: 'web_search' }] : []
+    const body: any = {
+      model: 'gpt-5',
+      input: [{ role: 'user', content: message }],
+      stream: true,
+      max_output_tokens: 12000,
+      reasoning: { effort: 'low' }
+    }
+    
+    if (previousResponseId) {
+      body.previous_response_id = previousResponseId
+    }
+    
+    if (tools.length > 0) {
+      body.tools = tools
+      body.tool_choice = 'auto'
+    }
+    
+    console.log('[STREAMING] Starting GPT-5 stream with:', {
+      model: body.model,
+      hasTools: tools.length > 0,
+      hasPreviousResponse: !!previousResponseId
+    })
+    
+    const response = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'responses=v1'
+      },
+      body: JSON.stringify(body)
+    })
+    
+    if (!response.ok) {
+      const errorText = await response.text()
+      console.error('[STREAMING] OpenAI API Error:', errorText)
+      return c.json({ error: 'Streaming request failed', details: errorText }, response.status)
+    }
+    
+    // Return the streaming response directly
+    return new Response(response.body, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*', // TODO: 本番では特定のオリジンに制限
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Methods': 'POST'
+      }
+    })
+    
+  } catch (error) {
+    console.error('[STREAMING] Endpoint error:', error)
+    return c.json({ error: 'Internal server error', details: error.toString() }, 500)
+  }
+})
+
 // Responses API chat endpoint
 app.post('/api/chat', async (c) => {
   try {
-    const { message, messages = [], useSearch = false, fileContent = null, fileIds = [], model = 'gpt-5' } = await c.req.json()
+    const { message, messages = [], useSearch = false, fileContent = null, fileIds = [], model = 'gpt-5', previousResponseId = null } = await c.req.json()
     const openaiKey = c.env.OPENAI_API_KEY
 
     if (!openaiKey) {
@@ -552,6 +638,7 @@ app.post('/api/chat', async (c) => {
     console.log('- input content:', inputMessages ? JSON.stringify(inputMessages).substring(0, 200) + '...' : 'null/undefined')
     console.log('- tools count:', tools.length)
     console.log('- GPT-5 only mode: true')
+    console.log('- previousResponseId:', previousResponseId ? 'provided' : 'none')
 
     // Use GPT-5 only system (no fallback)
     const { 
@@ -560,7 +647,7 @@ app.post('/api/chat', async (c) => {
       modelUsed, 
       modelsTried, 
       error: gpt5Error 
-    } = await callWithGPT5Only(openaiKey, model, inputMessages, tools)
+    } = await callWithGPT5Only(openaiKey, model, inputMessages, tools, previousResponseId)
 
     if (!responsesResult) {
       console.error('GPT-5 failed:', gpt5Error)
@@ -618,6 +705,7 @@ app.post('/api/chat', async (c) => {
 
     return c.json({
       message: responseMessage,
+      responseId: responsesResult?.id || null,  // Add responseId for conversation continuity
       searchUsed,
       fileUsed: !!fileContent || (Array.isArray(fileIds) && fileIds.length > 0),
       apiUsed: 'responses',
@@ -837,10 +925,10 @@ app.get('/', (c) => {
                             </h1>
                             <p class="text-sm text-gray-600">
                                 <i class="fas fa-lightning-bolt mr-1 text-yellow-500"></i>
-                                Powered by <span class="font-bold text-blue-600">GPT-5</span> + Auto-Fallback
-                                <span class="bg-green-100 text-green-800 px-2 py-1 rounded-full text-xs ml-2">
-                                    <i class="fas fa-star mr-1"></i>
-                                    Enhanced Mode
+                                Powered by <span class="font-bold text-blue-600">GPT-5</span> (No Fallback)
+                                <span class="bg-purple-100 text-purple-800 px-2 py-1 rounded-full text-xs ml-2">
+                                    <i class="fas fa-shield-alt mr-1"></i>
+                                    Exclusive Mode
                                 </span>
                             </p>
                         </div>
