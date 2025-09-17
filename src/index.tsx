@@ -580,18 +580,8 @@ app.post('/api/chat', async (c) => {
       })
     }
     
-    // Add Code Interpreter tool if Office files are attached
-    const hasOfficeFiles = Array.isArray(fileIds) && fileIds.length > 0
-    if (hasOfficeFiles) {
-      // Code Interpreter tool with required container parameter
-      tools.push({
-        type: 'code_interpreter',
-        container: {
-          type: 'auto'
-        }
-      })
-      console.log('[TOOLS] Added Code Interpreter with container for Office file processing')
-    }
+    // Note: Code Interpreter tool removed since we're blocking Excel files
+    // Excel files are not supported by Responses API and will be rejected before this point
 
     // Note: analyze_file tool removed - requires tool output submit implementation
     // Files are now handled via input_file format directly in messages
@@ -610,6 +600,20 @@ app.post('/api/chat', async (c) => {
     const hasFiles = (Array.isArray(fileIds) && fileIds.length > 0) || 
                      (fileContent && typeof fileContent === 'string' && fileContent.trim())
     
+    // Check if user is trying to use Excel files (not supported by Responses API)
+    if (Array.isArray(fileIds) && fileIds.length > 0) {
+      return c.json({
+        error: 'Excel files not supported',
+        message: 'Responses APIはExcelファイル（.xlsx, .xls）を直接サポートしていません。',
+        suggestion: 'ExcelファイルをCSV形式またはPDF形式で保存し直してからアップロードしてください。',
+        instructions: {
+          csv: 'Excelでファイルを開き、「名前を付けて保存」→「CSV(カンマ区切り)」で保存',
+          pdf: 'Excelでファイルを開き、「エクスポート」→「PDF」で保存'
+        },
+        supportedAlternatives: ['.csv', '.pdf', '.txt']
+      }, 400)
+    }
+    
     if (hasFiles) {
       // Multimodal content array format
       userContent = []
@@ -622,12 +626,11 @@ app.post('/api/chat', async (c) => {
         userContent.push({ type: 'input_text', text: `\n---\n【添付テキスト】\n${fileContent}` })
       }
       
-      // Add attached file IDs
+      // Note: fileIds should be empty here since we blocked Excel files above
+      // This section is for PDF and image files only
       if (Array.isArray(fileIds)) {
         for (const fid of fileIds) {
           if (typeof fid === 'string') {
-            // Note: Responses API may not support Excel files directly in input_file
-            // For now, we'll try to include them, but may need alternative approach
             userContent.push({ type: 'input_file', file_id: fid })
           }
         }
@@ -893,10 +896,14 @@ app.post('/api/upload', async (c) => {
         fileType: fileType,
         requiresCodeInterpreter: fileType === 'office',
         message: fileType === 'office' 
-          ? 'Office file uploaded successfully. Note: Responses API has limited Excel support. For best results, please convert to CSV or PDF format.' 
+          ? '⚠️ Office file uploaded but cannot be processed directly. Please convert to CSV or PDF format for analysis.' 
           : 'File uploaded to OpenAI successfully',
         limitation: fileType === 'office' 
-          ? 'Excel files may not work directly with Responses API. Consider converting to CSV format for data analysis.' 
+          ? {
+            issue: 'Responses API does not support Excel files directly',
+            solution: 'Convert Excel to CSV (for data) or PDF (for formatting)',
+            instructions: 'Excel → Save As → CSV (Comma delimited) or Export → PDF'
+          } 
           : null
       })
     }

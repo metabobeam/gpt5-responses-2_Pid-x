@@ -185,10 +185,20 @@ class ChatBot {
                 let statusText = `添付: ${responseData.filename} (${Math.round(responseData.bytes/1024)} KB) - ${responseData.fileType.toUpperCase()}`
                 
                 if (responseData.requiresCodeInterpreter) {
-                    statusText += ' 🔧 Code Interpreter'
+                    statusText += ' ⚠️ 未対応(変換必要)'
                 }
                 
                 this.fileStatusText.textContent = statusText
+                
+                // Show limitation warning for Office files
+                if (responseData.limitation) {
+                    console.warn('[UPLOAD] File limitation:', responseData.limitation)
+                    
+                    setTimeout(() => {
+                        const limitationMsg = `⚠️ ${responseData.limitation.issue}\n\n解決策: ${responseData.limitation.solution}\n手順: ${responseData.limitation.instructions}`
+                        alert(limitationMsg)
+                    }, 1000)
+                }
                 
             } else if (responseData.content) {
                 // Text file content
