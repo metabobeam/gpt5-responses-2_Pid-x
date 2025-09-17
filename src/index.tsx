@@ -427,6 +427,22 @@ async function callOnceWithModel(
   }
 }
 
+// Get file metadata from OpenAI Files API
+async function getFileMeta(openaiKey: string, id: string) {
+  const response = await fetch(`https://api.openai.com/v1/files/${id}`, {
+    headers: { 'Authorization': `Bearer ${openaiKey}` }
+  })
+  if (!response.ok) {
+    throw new Error(await response.text())
+  }
+  return await response.json() // { id, filename, purpose, ... }
+}
+
+// Check if file is an Office document
+function isOffice(filename: string) {
+  return /\.(xlsx|xls|docx|doc|pptx|ppt)$/i.test(filename || '')
+}
+
 // Code Interpreter function using Assistants API for Office files
 async function callWithCodeInterpreter(
   openaiKey: string,
@@ -574,7 +590,7 @@ async function callWithCodeInterpreter(
     // Step 5: Poll for completion with extended timeout for Code Interpreter
     let runStatus = run.status
     let attempts = 0
-    const maxAttempts = 90 // 180 seconds timeout (3 minutes) for Code Interpreter tasks
+    const maxAttempts = 300 // 600 seconds timeout (10 minutes) for Code Interpreter tasks
     
     while (['queued', 'in_progress', 'requires_action'].includes(runStatus) && attempts < maxAttempts) {
       await new Promise(resolve => setTimeout(resolve, 2000)) // Wait 2 seconds
@@ -738,12 +754,26 @@ async function callWithCodeInterpreter(
     // Get the latest assistant message (first in the sorted list)
     const latestMessage = assistantMessages[0]
     let responseText = ''
+    const files: { id: string; type: 'image' | 'file'; filename?: string }[] = []
     
-    // Extract text content from message
+    // Extract text content and generated files from message
     if (Array.isArray(latestMessage.content)) {
       for (const content of latestMessage.content) {
         if (content.type === 'text') {
           responseText += content.text.value
+        } else if (content.type === 'image_file') {
+          files.push({ 
+            id: content.image_file.file_id, 
+            type: 'image'
+          })
+          console.log('[CODE_INTERPRETER] Found generated image:', content.image_file.file_id)
+        } else if (content.type === 'file_path') {
+          files.push({ 
+            id: content.file_path.file_id, 
+            type: 'file', 
+            filename: content.file_path.filename 
+          })
+          console.log('[CODE_INTERPRETER] Found generated file:', content.file_path.filename)
         } else {
           console.log('[CODE_INTERPRETER] Found non-text content:', content.type)
         }
@@ -782,6 +812,7 @@ async function callWithCodeInterpreter(
     return {
       result: {
         message: responseText,
+        files, // Generated files (images, CSVs, etc.)
         thread_id: thread.id,
         run_id: run.id
       },
@@ -954,13 +985,6 @@ app.post('/api/chat', async (c) => {
         type: 'web_search'
       })
     }
-    
-    // Web search tool for Responses API (Office files handled separately above)
-    if (useSearch) {
-      tools.push({
-        type: 'web_search'
-      })
-    }
 
     // Note: analyze_file tool removed - requires tool output submit implementation
     // Files are now handled via input_file format directly in messages
@@ -979,9 +1003,35 @@ app.post('/api/chat', async (c) => {
     const hasFiles = (Array.isArray(fileIds) && fileIds.length > 0) || 
                      (fileContent && typeof fileContent === 'string' && fileContent.trim())
     
-    // Check if user has Office files - use Code Interpreter via Assistants API
+    // Separate Office files from other files
+    let officeFileIds: string[] = []
+    let nonOfficeFileIds: string[] = []
+    
     if (Array.isArray(fileIds) && fileIds.length > 0) {
-      console.log('[OFFICE_FILES] Detected Office files, using Code Interpreter via Assistants API')
+      console.log('[FILE_ROUTING] Analyzing uploaded files:', fileIds.length)
+      
+      try {
+        const metas = await Promise.all(fileIds.map(id => getFileMeta(openaiKey, id)))
+        
+        for (const { id, filename } of metas) {
+          if (isOffice(filename)) {
+            officeFileIds.push(id)
+            console.log('[FILE_ROUTING] Office file detected:', filename, '-> Code Interpreter')
+          } else {
+            nonOfficeFileIds.push(id)
+            console.log('[FILE_ROUTING] Non-Office file detected:', filename, '-> Responses API')
+          }
+        }
+      } catch (error) {
+        console.error('[FILE_ROUTING] Failed to get file metadata:', error)
+        // Fallback: treat all as non-Office files
+        nonOfficeFileIds = [...fileIds]
+      }
+    }
+    
+    // If Office files are present, use Code Interpreter via Assistants API
+    if (officeFileIds.length > 0) {
+      console.log('[OFFICE_FILES] Processing', officeFileIds.length, 'Office files with Code Interpreter')
       
       const { 
         result: codeInterpreterResult, 
@@ -989,7 +1039,7 @@ app.post('/api/chat', async (c) => {
         modelUsed, 
         modelsTried, 
         error: codeInterpreterError 
-      } = await callWithCodeInterpreter(openaiKey, message, fileIds, cleanMessages)
+      } = await callWithCodeInterpreter(openaiKey, message, officeFileIds, cleanMessages)
       
       if (!codeInterpreterResult) {
         console.error('[OFFICE_FILES] Code Interpreter failed:', codeInterpreterError)
@@ -1021,8 +1071,9 @@ app.post('/api/chat', async (c) => {
         searchUsed: false,
         fileUsed: true,
         apiUsed: 'assistants_code_interpreter',
-        attachmentsSeen: fileIds.length,
-        receivedFileIds: fileIds.length,
+        attachmentsSeen: officeFileIds.length,
+        receivedFileIds: officeFileIds.length,
+        generatedFiles: codeInterpreterResult.files || [], // Include generated files
         diagnostic: {
           modelRequested: model,
           modelUsed,
@@ -1046,10 +1097,9 @@ app.post('/api/chat', async (c) => {
         userContent.push({ type: 'input_text', text: `\n---\n【添付テキスト】\n${fileContent}` })
       }
       
-      // Note: fileIds should be empty here since we blocked Excel files above
-      // This section is for PDF and image files only
-      if (Array.isArray(fileIds)) {
-        for (const fid of fileIds) {
+      // Add non-Office files (PDF, images) to the content array
+      if (Array.isArray(nonOfficeFileIds)) {
+        for (const fid of nonOfficeFileIds) {
           if (typeof fid === 'string') {
             userContent.push({ type: 'input_file', file_id: fid })
           }
@@ -1149,18 +1199,21 @@ app.post('/api/chat', async (c) => {
     const attachmentsSeen = Array.isArray(userContent)
       ? userContent.filter(x => x?.type === 'input_file').length
       : 0
-    console.log('[DEBUG] Received fileIds:', Array.isArray(fileIds) ? fileIds.length : 0)
+    const totalFilesReceived = (officeFileIds?.length || 0) + (nonOfficeFileIds?.length || 0)
+    
+    console.log('[DEBUG] Total files received:', totalFilesReceived)
+    console.log('[DEBUG] Office files (Code Interpreter):', officeFileIds?.length || 0)
+    console.log('[DEBUG] Non-Office files (Responses API):', nonOfficeFileIds?.length || 0)
     console.log('[DEBUG] input_file parts:', attachmentsSeen)
-    console.log('[DEBUG] fileIds array:', fileIds)
 
     return c.json({
       message: responseMessage,
       responseId: responsesResult?.id || null,  // Add responseId for conversation continuity
       searchUsed,
-      fileUsed: !!fileContent || (Array.isArray(fileIds) && fileIds.length > 0),
+      fileUsed: !!fileContent || totalFilesReceived > 0,
       apiUsed: 'responses',
       attachmentsSeen,                      // UIで表示
-      receivedFileIds: Array.isArray(fileIds) ? fileIds.length : 0,  // UI/ログで表示
+      receivedFileIds: totalFilesReceived,  // UI/ログで表示
       // 診断情報を追加
       diagnostic: {
         modelRequested: model,
@@ -1348,6 +1401,41 @@ app.get('/api/supported-formats', async (c) => {
   })
 })
 
+// Generated file download proxy (OpenAI Files -> User)
+app.get('/api/openai-files/:id/content', async (c) => {
+  try {
+    const openaiKey = c.env.OPENAI_API_KEY
+    if (!openaiKey) {
+      return c.json({ error: 'OpenAI API key not configured' }, 400)
+    }
+
+    const fileId = c.req.param('id')
+    
+    const response = await fetch(`https://api.openai.com/v1/files/${fileId}/content`, {
+      headers: { 'Authorization': `Bearer ${openaiKey}` }
+    })
+    
+    if (!response.ok) {
+      const errorText = await response.text()
+      return c.text(errorText, response.status)
+    }
+    
+    // Pass through content-type from OpenAI
+    const contentType = response.headers.get('Content-Type') || 'application/octet-stream'
+    
+    return new Response(response.body, {
+      headers: {
+        'Content-Type': contentType,
+        'Cache-Control': 'public, max-age=3600'
+      }
+    })
+    
+  } catch (error) {
+    console.error('File content proxy error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
 // Get uploaded files list
 app.get('/api/files', async (c) => {
   try {
@@ -1497,7 +1585,7 @@ app.get('/', (c) => {
                         <label for="fileInput" class="bg-green-500 hover:bg-green-600 text-white px-3 py-2 rounded cursor-pointer text-sm transition-colors">
                             <i class="fas fa-upload mr-1"></i>ファイル
                         </label>
-                        <input type="file" id="fileInput" class="hidden" accept=".txt,.md,.json,.csv,.log,.pdf,.png,.jpg,.jpeg,.gif,.webp,.xlsx,.xls,.docx,.doc,.pptx,.ppt"
+                        <input type="file" id="fileInput" class="hidden" accept=".txt,.md,.json,.csv,.log,.pdf,.png,.jpg,.jpeg,.gif,.webp,.xlsx,.xls,.docx,.doc,.pptx,.ppt" />
                         <button id="clearChat" class="bg-red-500 hover:bg-red-600 text-white px-3 py-2 rounded text-sm transition-colors">
                             <i class="fas fa-trash mr-1"></i>クリア
                         </button>
