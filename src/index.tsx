@@ -738,6 +738,23 @@ app.post('/api/chat', async (c) => {
 // Web search is now handled by Responses API built-in web_search tool
 // No custom implementation needed
 
+// Supported file formats for GPT-5 Responses API
+const SUPPORTED_FILE_FORMATS = {
+  // Text files (can be read directly)
+  text: ['.txt', '.md', '.json', '.csv', '.log'],
+  // Files supported by Responses API
+  responses_api: ['.pdf'],
+  // Image files (supported by GPT-5)
+  images: ['.png', '.jpg', '.jpeg', '.gif', '.webp']
+}
+
+// Get all supported extensions
+const ALL_SUPPORTED_EXTENSIONS = [
+  ...SUPPORTED_FILE_FORMATS.text,
+  ...SUPPORTED_FILE_FORMATS.responses_api,
+  ...SUPPORTED_FILE_FORMATS.images
+]
+
 // File upload endpoint for OpenAI Files API
 app.post('/api/upload', async (c) => {
   try {
@@ -752,50 +769,101 @@ app.post('/api/upload', async (c) => {
     if (!file) {
       return c.json({ error: 'No file provided' }, 400)
     }
-
-    // Create FormData for OpenAI API
-    const openaiFormData = new FormData()
-    openaiFormData.append('file', file)
-    openaiFormData.append('purpose', 'user_data') // Use 'user_data' purpose for model input
-
-    // Upload to OpenAI Files API
-    const uploadResponse = await fetch('https://api.openai.com/v1/files', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${openaiKey}`
-      },
-      body: openaiFormData
-    })
-
-    if (!uploadResponse.ok) {
-      const errorData = await uploadResponse.text()
-      console.error('OpenAI Files API Error:', errorData)
-      return c.json({ error: 'File upload failed', details: errorData }, 500)
+    
+    // Check file extension
+    const fileName = file.name.toLowerCase()
+    const fileExtension = fileName.substring(fileName.lastIndexOf('.'))
+    
+    if (!ALL_SUPPORTED_EXTENSIONS.includes(fileExtension)) {
+      console.log(`[UPLOAD] Unsupported file type: ${fileExtension}`)
+      return c.json({ 
+        error: 'Unsupported file format',
+        details: `File type '${fileExtension}' is not supported. Supported formats: ${ALL_SUPPORTED_EXTENSIONS.join(', ')}`,
+        supportedFormats: ALL_SUPPORTED_EXTENSIONS
+      }, 400)
     }
+    
+    console.log(`[UPLOAD] Processing supported file: ${fileName} (${fileExtension})`)
 
-    const uploadData = await uploadResponse.json()
-
-    // For text files, also return content for immediate use
+    // Handle different file types
     let fileContent = null
-    if (file.type.startsWith('text/') || file.name.endsWith('.txt') || file.name.endsWith('.md')) {
+    let shouldUploadToOpenAI = true
+    
+    // For text files, read content directly and don't upload to OpenAI
+    if (SUPPORTED_FILE_FORMATS.text.includes(fileExtension)) {
       try {
         fileContent = await file.text()
+        shouldUploadToOpenAI = false
+        console.log(`[UPLOAD] Read text file content: ${fileContent.length} characters`)
+        
+        return c.json({
+          fileId: null, // No OpenAI file ID for text files
+          filename: file.name,
+          bytes: file.size,
+          content: fileContent,
+          fileType: 'text',
+          message: 'Text file content read successfully (not uploaded to OpenAI)'
+        })
       } catch (error) {
-        console.error('Error reading file content:', error)
+        console.error('Error reading text file:', error)
+        return c.json({ error: 'Failed to read text file content' }, 500)
       }
     }
+    
+    // For PDF and image files, upload to OpenAI Files API
+    if (shouldUploadToOpenAI) {
+      const openaiFormData = new FormData()
+      openaiFormData.append('file', file)
+      openaiFormData.append('purpose', 'user_data') // Use 'user_data' purpose for model input
 
-    return c.json({
-      fileId: uploadData.id,
-      filename: uploadData.filename,
-      bytes: uploadData.bytes,
-      content: fileContent
-    })
+      const uploadResponse = await fetch('https://api.openai.com/v1/files', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${openaiKey}`
+        },
+        body: openaiFormData
+      })
+
+      if (!uploadResponse.ok) {
+        const errorData = await uploadResponse.text()
+        console.error('OpenAI Files API Error:', errorData)
+        return c.json({ 
+          error: 'File upload to OpenAI failed', 
+          details: errorData,
+          suggestion: fileExtension === '.xlsx' ? 'Excel files are not supported by GPT-5. Please convert to PDF or CSV format.' : 'Please try a different file format.'
+        }, 500)
+      }
+
+      const uploadData = await uploadResponse.json()
+      console.log(`[UPLOAD] Successfully uploaded to OpenAI: ${uploadData.id}`)
+
+      return c.json({
+        fileId: uploadData.id,
+        filename: uploadData.filename,
+        bytes: uploadData.bytes,
+        content: null,
+        fileType: SUPPORTED_FILE_FORMATS.responses_api.includes(fileExtension) ? 'pdf' : 'image',
+        message: 'File uploaded to OpenAI successfully'
+      })
+    }
 
   } catch (error) {
     console.error('Upload endpoint error:', error)
     return c.json({ error: 'Internal server error' }, 500)
   }
+})
+
+// Get supported file formats
+app.get('/api/supported-formats', async (c) => {
+  return c.json({
+    supported: ALL_SUPPORTED_EXTENSIONS,
+    categories: {
+      text: SUPPORTED_FILE_FORMATS.text,
+      pdf: SUPPORTED_FILE_FORMATS.responses_api,
+      images: SUPPORTED_FILE_FORMATS.images
+    },
+    message: 'GPT-5 supported file formats for Responses API'
+  })
 })
 
 // Get uploaded files list
@@ -947,7 +1015,7 @@ app.get('/', (c) => {
                         <label for="fileInput" class="bg-green-500 hover:bg-green-600 text-white px-3 py-2 rounded cursor-pointer text-sm transition-colors">
                             <i class="fas fa-upload mr-1"></i>ファイル
                         </label>
-                        <input type="file" id="fileInput" class="hidden" accept=".txt,.md,.json,.csv,.log,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp">
+                        <input type="file" id="fileInput" class="hidden" accept=".txt,.md,.json,.csv,.log,.pdf,.png,.jpg,.jpeg,.gif,.webp"
                         <button id="clearChat" class="bg-red-500 hover:bg-red-600 text-white px-3 py-2 rounded text-sm transition-colors">
                             <i class="fas fa-trash mr-1"></i>クリア
                         </button>
@@ -980,6 +1048,10 @@ app.get('/', (c) => {
                             <i class="fas fa-comments text-4xl mb-2"></i>
                             <p><span class="text-blue-600 font-bold">GPT-5</span>との新しい会話を開始しましょう</p>
                             <p class="text-sm mt-1">Web検索とファイルアップロード機能が利用できます。</p>
+                            <p class="text-xs mt-1 text-gray-400">
+                                <i class="fas fa-file mr-1"></i>
+                                対応形式: PDF, テキスト(.txt,.md,.json,.csv,.log), 画像(.png,.jpg,.jpeg,.gif,.webp)
+                            </p>
                             <p class="text-xs mt-2 text-purple-600">
                                 <i class="fas fa-magic mr-1"></i>
                                 GPT-5 × Responses API Enhanced Mode
