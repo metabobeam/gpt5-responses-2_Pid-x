@@ -419,81 +419,55 @@ async function callOnceWithModel(
   }
 }
 
-// Automatic fallback function: gpt-5 → gpt-5-mini → gpt-4o
-async function callWithFallback(
+// GPT-5 only function: No fallback to other models
+async function callWithGPT5Only(
   openaiKey: string,
   model: string,
   inputMessages: any[],
-  tools: any[] = [],
-  allowFallback: boolean = true
+  tools: any[] = []
 ): Promise<{ result: any; partial: boolean; modelUsed: string; modelsTried: string[]; error?: string }> {
   
   const modelsTried: string[] = []
-  let finalResult = null
-  let finalPartial = false
-  let finalModelUsed = model
   
-  // Define fallback chain based on requested model
-  // GPT-5 is now available!
-  let modelsToTry: string[]
-  if (model === 'gpt-5' && allowFallback) {
-    modelsToTry = ['gpt-5', 'gpt-4o', 'gpt-4o-mini']  // GPT-5 first, then fallback
-  } else if (model === 'gpt-4o' && allowFallback) {
-    modelsToTry = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo']
-  } else if (model === 'gpt-4o-mini' && allowFallback) {
-    modelsToTry = ['gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo']
-  } else if (model === 'gpt-4-turbo' && allowFallback) {
-    modelsToTry = ['gpt-4-turbo', 'gpt-4o-mini', 'gpt-3.5-turbo']
-  } else if (model === 'gpt-3.5-turbo' && allowFallback) {
-    modelsToTry = ['gpt-3.5-turbo', 'gpt-4o-mini']
-  } else if (model === 'gpt-5-mini' && allowFallback) {
-    // GPT-5-mini doesn't exist yet, fallback to GPT-4o-mini
-    modelsToTry = ['gpt-4o-mini', 'gpt-4o', 'gpt-3.5-turbo']
-  } else {
-    modelsToTry = [model]  // No fallback
-  }
-  
-  console.log(`[FALLBACK] Starting with model chain: ${modelsToTry.join(' → ')}`)
-  
-  for (const currentModel of modelsToTry) {
-    modelsTried.push(currentModel)
-    
-    const { result, partial, error } = await callOnceWithModel(
-      openaiKey, 
-      currentModel, 
-      inputMessages, 
-      tools
-    )
-    
-    if (result && !error) {
-      // Success! Use this result
-      finalResult = result
-      finalPartial = partial
-      finalModelUsed = currentModel
-      console.log(`[FALLBACK] Success with ${currentModel} (partial: ${partial})`)
-      break
-    } else {
-      console.log(`[FALLBACK] ${currentModel} failed: ${error}`)
-      
-      // If this was the last model in the chain, we're out of options
-      if (currentModel === modelsToTry[modelsToTry.length - 1]) {
-        console.log(`[FALLBACK] All models failed. Final error: ${error}`)
-        return {
-          result: null,
-          partial: false,
-          modelUsed: currentModel,
-          modelsTried,
-          error: `All models failed. Last error: ${error}`
-        }
-      }
+  // Only use GPT-5, reject any other model request
+  if (model !== 'gpt-5') {
+    console.log(`[GPT5_ONLY] Rejecting non-GPT-5 model request: ${model}`)
+    return {
+      result: null,
+      partial: false,
+      modelUsed: model,
+      modelsTried: [model],
+      error: `Only GPT-5 model is allowed. Requested model '${model}' is not supported.`
     }
   }
   
-  return {
-    result: finalResult,
-    partial: finalPartial,
-    modelUsed: finalModelUsed,
-    modelsTried
+  console.log(`[GPT5_ONLY] Using GPT-5 exclusively`)
+  modelsTried.push('gpt-5')
+  
+  const { result, partial, error } = await callOnceWithModel(
+    openaiKey, 
+    'gpt-5', 
+    inputMessages, 
+    tools
+  )
+  
+  if (result && !error) {
+    console.log(`[GPT5_ONLY] Success with GPT-5 (partial: ${partial})`)
+    return {
+      result: result,
+      partial: partial,
+      modelUsed: 'gpt-5',
+      modelsTried
+    }
+  } else {
+    console.log(`[GPT5_ONLY] GPT-5 failed: ${error}`)
+    return {
+      result: null,
+      partial: false,
+      modelUsed: 'gpt-5',
+      modelsTried,
+      error: `GPT-5 failed: ${error}`
+    }
   }
 }
 
@@ -503,7 +477,7 @@ app.use('/static/*', serveStatic({ root: './public' }))
 // Responses API chat endpoint
 app.post('/api/chat', async (c) => {
   try {
-    const { message, messages = [], useSearch = false, fileContent = null, fileIds = [], model = 'gpt-5', allowModelFallback = true } = await c.req.json()
+    const { message, messages = [], useSearch = false, fileContent = null, fileIds = [], model = 'gpt-5' } = await c.req.json()
     const openaiKey = c.env.OPENAI_API_KEY
 
     if (!openaiKey) {
@@ -577,30 +551,30 @@ app.post('/api/chat', async (c) => {
     console.log('- input type:', typeof inputMessages)
     console.log('- input content:', inputMessages ? JSON.stringify(inputMessages).substring(0, 200) + '...' : 'null/undefined')
     console.log('- tools count:', tools.length)
-    console.log('- allow fallback:', allowModelFallback)
+    console.log('- GPT-5 only mode: true')
 
-    // Use enhanced fallback system
+    // Use GPT-5 only system (no fallback)
     const { 
       result: responsesResult, 
       partial, 
       modelUsed, 
       modelsTried, 
-      error: fallbackError 
-    } = await callWithFallback(openaiKey, model, inputMessages, tools, allowModelFallback)
+      error: gpt5Error 
+    } = await callWithGPT5Only(openaiKey, model, inputMessages, tools)
 
     if (!responsesResult) {
-      console.error('All models failed:', fallbackError)
+      console.error('GPT-5 failed:', gpt5Error)
       
       return c.json({ 
-        error: 'All models failed', 
-        details: fallbackError,
-        message: `すべてのモデル (${modelsTried.join(', ')}) でエラーが発生しました。`,
+        error: 'GPT-5 failed', 
+        details: gpt5Error,
+        message: `GPT-5でエラーが発生しました。`,
         diagnostic: {
           modelRequested: model,
           modelsTried,
           modelUsed: null,
           partial: false,
-          fallbackUsed: modelsTried.length > 1
+          fallbackUsed: false
         }
       }, 500)
     }
@@ -655,7 +629,7 @@ app.post('/api/chat', async (c) => {
         modelUsed,
         modelsTried,
         partial,
-        fallbackUsed: modelUsed !== model
+        fallbackUsed: false
       }
     })
 

@@ -245,8 +245,7 @@ class ChatBot {
                 useSearch: this.useSearch,
                 fileContent: this.currentFileContent,
                 fileIds: this.currentFileIds || [], // 確実に配列として送信
-                model: 'gpt-5', // GPT-5をデフォルトとして使用（利用可能！）
-                allowModelFallback: true // フォールバックを有効に
+                model: 'gpt-5' // GPT-5のみ使用（フォールバックなし）
             }
             
             console.log('[SEND] ★ Final payload fileIds:', requestData.fileIds)
@@ -281,15 +280,11 @@ class ChatBot {
             
             this.addMessage('assistant', responseData.message)
             
-            // Enhanced diagnostic display
+            // GPT-5 only diagnostic display
             let modelInfo = ''
             if (responseData.diagnostic) {
                 const d = responseData.diagnostic
-                if (d.fallbackUsed) {
-                    modelInfo = ` (フォールバック: ${d.modelRequested} → ${d.modelUsed})`
-                } else {
-                    modelInfo = ` (${d.modelUsed})`
-                }
+                modelInfo = ` (GPT-5専用)`
                 
                 if (d.partial) {
                     modelInfo += ' [Partial]'
