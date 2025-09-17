@@ -573,11 +573,24 @@ app.post('/api/chat', async (c) => {
     // Prepare tools for Responses API
     const tools = []
     
-    // Add web search tool if enabled - use official web_search type
+    // Add web search tool if enabled
     if (useSearch) {
       tools.push({
         type: 'web_search'
       })
+    }
+    
+    // Add Code Interpreter tool if Office files are attached
+    const hasOfficeFiles = Array.isArray(fileIds) && fileIds.length > 0
+    if (hasOfficeFiles) {
+      // Code Interpreter tool with required container parameter
+      tools.push({
+        type: 'code_interpreter',
+        container: {
+          type: 'auto'
+        }
+      })
+      console.log('[TOOLS] Added Code Interpreter with container for Office file processing')
     }
 
     // Note: analyze_file tool removed - requires tool output submit implementation
@@ -609,10 +622,12 @@ app.post('/api/chat', async (c) => {
         userContent.push({ type: 'input_text', text: `\n---\n【添付テキスト】\n${fileContent}` })
       }
       
-      // Add attached file IDs (for PDF/images/Office files)
+      // Add attached file IDs
       if (Array.isArray(fileIds)) {
         for (const fid of fileIds) {
           if (typeof fid === 'string') {
+            // Note: Responses API may not support Excel files directly in input_file
+            // For now, we'll try to include them, but may need alternative approach
             userContent.push({ type: 'input_file', file_id: fid })
           }
         }
@@ -625,7 +640,7 @@ app.post('/api/chat', async (c) => {
     const inputMessages = [
       { 
         role: 'system', 
-        content: 'あなたは有能なAIアシスタントです。ユーザーがファイルを添付した場合はWeb検索よりも**添付ファイルの内容を最優先**で精読し、要約・該当ページ/スライド番号の明示・根拠の引用を行って日本語で回答してください。検索を行う場合は出典を明記してください。'
+        content: 'あなたは有能なAIアシスタントです。ユーザーがファイルを添付した場合はWeb検索よりも**添付ファイルの内容を最優先**で精読し、要約・該当ページ/スライド番号の明示・根拠の引用を行って日本語で回答してください。ExcelファイルやOffice文書の場合は、Code Interpreterを使用してデータを分析し、具体的な数値や内容を示してください。検索を行う場合は出典を明記してください。'
       },
       ...cleanMessages,
       { role: 'user', content: userContent }
@@ -652,10 +667,22 @@ app.post('/api/chat', async (c) => {
     if (!responsesResult) {
       console.error('GPT-5 failed:', gpt5Error)
       
+      // Special handling for Office file errors
+      const isOfficeFileError = gpt5Error && gpt5Error.includes('Expected file type to be a supported format: .pdf but got')
+      
+      let errorMessage = `GPT-5でエラーが発生しました。`
+      let suggestion = ''
+      
+      if (isOfficeFileError) {
+        errorMessage = 'Responses APIはExcelファイルを直接サポートしていません。'
+        suggestion = 'ExcelファイルをCSV形式で保存し直してからアップロードしてください。またはPDF形式で保存してください。'
+      }
+      
       return c.json({ 
         error: 'GPT-5 failed', 
         details: gpt5Error,
-        message: `GPT-5でエラーが発生しました。`,
+        message: errorMessage,
+        suggestion: suggestion,
         diagnostic: {
           modelRequested: model,
           modelsTried,
@@ -742,17 +769,20 @@ app.post('/api/chat', async (c) => {
 const SUPPORTED_FILE_FORMATS = {
   // Text files (can be read directly)
   text: ['.txt', '.md', '.json', '.csv', '.log'],
-  // Files supported by Responses API
+  // Files supported by Responses API directly
   responses_api: ['.pdf'],
   // Image files (supported by GPT-5)
-  images: ['.png', '.jpg', '.jpeg', '.gif', '.webp']
+  images: ['.png', '.jpg', '.jpeg', '.gif', '.webp'],
+  // Office files (require Code Interpreter tool)
+  office: ['.xlsx', '.xls', '.docx', '.doc', '.pptx', '.ppt']
 }
 
 // Get all supported extensions
 const ALL_SUPPORTED_EXTENSIONS = [
   ...SUPPORTED_FILE_FORMATS.text,
   ...SUPPORTED_FILE_FORMATS.responses_api,
-  ...SUPPORTED_FILE_FORMATS.images
+  ...SUPPORTED_FILE_FORMATS.images,
+  ...SUPPORTED_FILE_FORMATS.office
 ]
 
 // File upload endpoint for OpenAI Files API
@@ -788,9 +818,21 @@ app.post('/api/upload', async (c) => {
     // Handle different file types
     let fileContent = null
     let shouldUploadToOpenAI = true
+    let fileType = 'unknown'
+    
+    // Determine file type
+    if (SUPPORTED_FILE_FORMATS.text.includes(fileExtension)) {
+      fileType = 'text'
+    } else if (SUPPORTED_FILE_FORMATS.responses_api.includes(fileExtension)) {
+      fileType = 'pdf'
+    } else if (SUPPORTED_FILE_FORMATS.images.includes(fileExtension)) {
+      fileType = 'image'
+    } else if (SUPPORTED_FILE_FORMATS.office.includes(fileExtension)) {
+      fileType = 'office'
+    }
     
     // For text files, read content directly and don't upload to OpenAI
-    if (SUPPORTED_FILE_FORMATS.text.includes(fileExtension)) {
+    if (fileType === 'text') {
       try {
         fileContent = await file.text()
         shouldUploadToOpenAI = false
@@ -810,11 +852,17 @@ app.post('/api/upload', async (c) => {
       }
     }
     
-    // For PDF and image files, upload to OpenAI Files API
+    // For PDF, image, and Office files, upload to OpenAI Files API
     if (shouldUploadToOpenAI) {
       const openaiFormData = new FormData()
       openaiFormData.append('file', file)
-      openaiFormData.append('purpose', 'user_data') // Use 'user_data' purpose for model input
+      
+      // Use appropriate purpose based on file type
+      if (fileType === 'office') {
+        openaiFormData.append('purpose', 'assistants') // Code Interpreter requires assistants purpose
+      } else {
+        openaiFormData.append('purpose', 'user_data') // For direct model input (PDF, images)
+      }
 
       const uploadResponse = await fetch('https://api.openai.com/v1/files', {
         method: 'POST',
@@ -830,20 +878,26 @@ app.post('/api/upload', async (c) => {
         return c.json({ 
           error: 'File upload to OpenAI failed', 
           details: errorData,
-          suggestion: fileExtension === '.xlsx' ? 'Excel files are not supported by GPT-5. Please convert to PDF or CSV format.' : 'Please try a different file format.'
+          suggestion: fileType === 'office' ? 'Office files require Code Interpreter. Please ensure the file is not corrupted.' : 'Please try a different file format.'
         }, 500)
       }
 
       const uploadData = await uploadResponse.json()
-      console.log(`[UPLOAD] Successfully uploaded to OpenAI: ${uploadData.id}`)
+      console.log(`[UPLOAD] Successfully uploaded to OpenAI: ${uploadData.id} (${fileType})`)
 
       return c.json({
         fileId: uploadData.id,
         filename: uploadData.filename,
         bytes: uploadData.bytes,
         content: null,
-        fileType: SUPPORTED_FILE_FORMATS.responses_api.includes(fileExtension) ? 'pdf' : 'image',
-        message: 'File uploaded to OpenAI successfully'
+        fileType: fileType,
+        requiresCodeInterpreter: fileType === 'office',
+        message: fileType === 'office' 
+          ? 'Office file uploaded successfully. Note: Responses API has limited Excel support. For best results, please convert to CSV or PDF format.' 
+          : 'File uploaded to OpenAI successfully',
+        limitation: fileType === 'office' 
+          ? 'Excel files may not work directly with Responses API. Consider converting to CSV format for data analysis.' 
+          : null
       })
     }
 
@@ -860,9 +914,15 @@ app.get('/api/supported-formats', async (c) => {
     categories: {
       text: SUPPORTED_FILE_FORMATS.text,
       pdf: SUPPORTED_FILE_FORMATS.responses_api,
-      images: SUPPORTED_FILE_FORMATS.images
+      images: SUPPORTED_FILE_FORMATS.images,
+      office: SUPPORTED_FILE_FORMATS.office
     },
-    message: 'GPT-5 supported file formats for Responses API'
+    tools: {
+      code_interpreter: 'Required for Office files (.xlsx, .docx, .pptx)',
+      web_search: 'Optional for real-time information',
+      direct_input: 'Used for PDF and image files'
+    },
+    message: 'GPT-5 supported file formats with Code Interpreter for Office files'
   })
 })
 
@@ -1015,7 +1075,7 @@ app.get('/', (c) => {
                         <label for="fileInput" class="bg-green-500 hover:bg-green-600 text-white px-3 py-2 rounded cursor-pointer text-sm transition-colors">
                             <i class="fas fa-upload mr-1"></i>ファイル
                         </label>
-                        <input type="file" id="fileInput" class="hidden" accept=".txt,.md,.json,.csv,.log,.pdf,.png,.jpg,.jpeg,.gif,.webp"
+                        <input type="file" id="fileInput" class="hidden" accept=".txt,.md,.json,.csv,.log,.pdf,.png,.jpg,.jpeg,.gif,.webp,.xlsx,.xls,.docx,.doc,.pptx,.ppt"
                         <button id="clearChat" class="bg-red-500 hover:bg-red-600 text-white px-3 py-2 rounded text-sm transition-colors">
                             <i class="fas fa-trash mr-1"></i>クリア
                         </button>
@@ -1050,7 +1110,7 @@ app.get('/', (c) => {
                             <p class="text-sm mt-1">Web検索とファイルアップロード機能が利用できます。</p>
                             <p class="text-xs mt-1 text-gray-400">
                                 <i class="fas fa-file mr-1"></i>
-                                対応形式: PDF, テキスト(.txt,.md,.json,.csv,.log), 画像(.png,.jpg,.jpeg,.gif,.webp)
+                                対応形式: PDF, Office(.xlsx,.docx,.pptx), テキスト(.txt,.md,.csv), 画像(.png,.jpg,.jpeg,.gif,.webp)
                             </p>
                             <p class="text-xs mt-2 text-purple-600">
                                 <i class="fas fa-magic mr-1"></i>

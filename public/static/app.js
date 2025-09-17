@@ -151,39 +151,66 @@ class ChatBot {
             const responseData = await response.json()
             console.log('[UPLOAD] Response data:', responseData)
             
-            if (!response.ok || !responseData.fileId) {
-                const errorMsg = responseData.details || responseData.error || 'Unknown error'
-                console.error('[UPLOAD] Upload failed:', errorMsg)
-                alert('アップロード失敗: ' + errorMsg)
+            if (!response.ok) {
+                const errorMsg = responseData.error || 'Unknown error'
+                const details = responseData.details || ''
+                const suggestion = responseData.suggestion || ''
+                
+                console.error('[UPLOAD] Upload failed:', errorMsg, details)
+                
+                let alertMessage = `アップロード失敗: ${errorMsg}`
+                if (suggestion) {
+                    alertMessage += `\n\n推奨: ${suggestion}`
+                }
+                if (responseData.supportedFormats) {
+                    alertMessage += `\n\n対応形式: ${responseData.supportedFormats.join(', ')}`
+                }
+                
+                alert(alertMessage)
                 return
             }
             
-            // 超重要：file_id を確実に保持
-            console.log('[UPLOAD] Before adding - current fileIds:', this.currentFileIds)
+            // Handle different file types appropriately
+            console.log('[UPLOAD] Processing file response:', responseData)
             
-            // OpenAIのFile IDは通常 'file-...' の形式。prefix判定は不要にする
-            if (typeof responseData.fileId === 'string') {
-                // 既存のIDをクリアして新しいものを追加（単一ファイル用）
+            if (responseData.fileId) {
+                // OpenAI file (PDF, images, Office files)
                 this.currentFileIds = [responseData.fileId]
-                
-                console.log('[UPLOAD] ✅ File ID successfully added:', responseData.fileId)
-                console.log('[UPLOAD] ✅ Current fileIds array:', this.currentFileIds)
-                console.log('[UPLOAD] ✅ fileIds length:', this.currentFileIds.length)
-                
-                // インスタンス変数も更新
                 this.currentFile = responseData
-                this.currentFileContent = responseData.content || null
+                this.currentFileContent = null
                 
-                // UI更新
+                console.log('[UPLOAD] ✅ OpenAI File ID added:', responseData.fileId)
+                
                 this.fileStatus.classList.remove('hidden')
-                this.fileStatusText.textContent = `添付: ${responseData.filename} (${Math.round(responseData.bytes/1024)} KB) - ID: ${responseData.fileId}`
+                let statusText = `添付: ${responseData.filename} (${Math.round(responseData.bytes/1024)} KB) - ${responseData.fileType.toUpperCase()}`
                 
-                this.showStatus(`ファイルアップロード完了: ${responseData.filename}`)
+                if (responseData.requiresCodeInterpreter) {
+                    statusText += ' 🔧 Code Interpreter'
+                }
                 
+                this.fileStatusText.textContent = statusText
+                
+            } else if (responseData.content) {
+                // Text file content
+                this.currentFileIds = []
+                this.currentFile = responseData
+                this.currentFileContent = responseData.content
+                
+                console.log('[UPLOAD] ✅ Text content loaded:', responseData.content.length, 'characters')
+                
+                this.fileStatus.classList.remove('hidden')
+                this.fileStatusText.textContent = `添付: ${responseData.filename} (${Math.round(responseData.bytes/1024)} KB) - テキストファイル`
             } else {
-                console.error('[UPLOAD] ❌ No valid file ID received:', responseData)
-                alert('無効なファイルIDが返されました')
+                console.error('[UPLOAD] ❌ No file ID or content received:', responseData)
+                alert('無効なファイルレスポンスでした')
+                return
             }
+            
+            console.log('[UPLOAD] ✅ Current fileIds array:', this.currentFileIds)
+            console.log('[UPLOAD] ✅ fileIds length:', this.currentFileIds.length)
+            console.log('[UPLOAD] ✅ Content length:', this.currentFileContent ? this.currentFileContent.length : 0)
+            
+            this.showStatus(`ファイルアップロード完了: ${responseData.filename}`)
             
         } catch (error) {
             console.error('[UPLOAD] ❌ Upload error:', error)
