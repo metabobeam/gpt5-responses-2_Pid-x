@@ -431,7 +431,8 @@ async function callOnceWithModel(
 async function callWithCodeInterpreter(
   openaiKey: string,
   message: string,
-  fileIds: string[]
+  fileIds: string[],
+  conversationHistory: any[] = []
 ): Promise<{ result: any; partial: boolean; modelUsed: string; modelsTried: string[]; error?: string }> {
   console.log(`[CODE_INTERPRETER] Starting Assistants API with ${fileIds.length} files`)
   
@@ -446,7 +447,7 @@ async function callWithCodeInterpreter(
       },
       body: JSON.stringify({
         name: 'GPT-5 Code Interpreter',
-        instructions: 'あなたは有能なAIアシスタントです。添付されたファイルを詳細に分析し、データの傾向、パターン、洞察を日本語で提供してください。ExcelやCSVファイルの場合は、データの要約、統計、可視化を行ってください。',
+        instructions: 'あなたは有能なAIアシスタントです。添付されたファイルを詳細に分析し、データの傾向、パターン、洞察を日本語で提供してください。ExcelやCSVファイルの場合は、データの要約、統計、可視化を行ってください。ユーザーとの過去の会話内容を考慮して、継続的で一貫した回答を提供してください。',
         model: 'gpt-4o', // Code Interpreter is available on gpt-4o
         tools: [{ type: 'code_interpreter' }]
       })
@@ -493,11 +494,25 @@ async function callWithCodeInterpreter(
     const thread = await threadResponse.json()
     console.log('[CODE_INTERPRETER] Thread created:', thread.id)
     
-    // Step 3: Add Message with file attachments
+    // Step 3: Add current message with file attachments and conversation context
     const attachments = fileIds.map(fileId => ({
       file_id: fileId,
       tools: [{ type: 'code_interpreter' }]
     }))
+    
+    // Build contextual message including conversation history summary
+    let contextualMessage = message
+    if (conversationHistory.length > 0) {
+      console.log('[CODE_INTERPRETER] Including conversation context:', conversationHistory.length, 'messages')
+      
+      // Create a summary of recent conversation for context
+      const recentMessages = conversationHistory.slice(-6) // Last 6 messages
+      const conversationContext = recentMessages
+        .map(msg => `${msg.role}: ${typeof msg.content === 'string' ? msg.content.substring(0, 200) : JSON.stringify(msg.content).substring(0, 200)}`)
+        .join('\n')
+      
+      contextualMessage = `【過去の会話】\n${conversationContext}\n\n【現在の質問】\n${message}\n\n上記の会話の流れを踏まえて回答してください。`
+    }
     
     const messageResponse = await fetch(`https://api.openai.com/v1/threads/${thread.id}/messages`, {
       method: 'POST',
@@ -508,7 +523,7 @@ async function callWithCodeInterpreter(
       },
       body: JSON.stringify({
         role: 'user',
-        content: message,
+        content: contextualMessage,
         attachments: attachments
       })
     })
@@ -649,12 +664,34 @@ async function callWithCodeInterpreter(
     
     if (runStatus !== 'completed') {
       console.error('[CODE_INTERPRETER] Run did not complete successfully:', runStatus)
+      
+      // Try to get error details from the run
+      let errorDetails = `Status: ${runStatus}`
+      try {
+        const runDetailsResponse = await fetch(`https://api.openai.com/v1/threads/${thread.id}/runs/${run.id}`, {
+          headers: {
+            'Authorization': `Bearer ${openaiKey}`,
+            'OpenAI-Beta': 'assistants=v2'
+          }
+        })
+        
+        if (runDetailsResponse.ok) {
+          const runDetails = await runDetailsResponse.json()
+          if (runDetails.last_error) {
+            errorDetails += `. Error: ${runDetails.last_error.message || 'Unknown error'}`
+            console.error('[CODE_INTERPRETER] Run error details:', runDetails.last_error)
+          }
+        }
+      } catch (detailError) {
+        console.warn('[CODE_INTERPRETER] Could not retrieve error details:', detailError)
+      }
+      
       return {
         result: null,
         partial: false,
         modelUsed: 'gpt-4o',
         modelsTried: ['gpt-4o'],
-        error: `Code Interpreter failed with status: ${runStatus}`
+        error: `Code Interpreter failed: ${errorDetails}. 会話履歴が長すぎるか、ファイルサイズが大きすぎる可能性があります。`
       }
     }
     
@@ -952,7 +989,7 @@ app.post('/api/chat', async (c) => {
         modelUsed, 
         modelsTried, 
         error: codeInterpreterError 
-      } = await callWithCodeInterpreter(openaiKey, message, fileIds)
+      } = await callWithCodeInterpreter(openaiKey, message, fileIds, cleanMessages)
       
       if (!codeInterpreterResult) {
         console.error('[OFFICE_FILES] Code Interpreter failed:', codeInterpreterError)
@@ -975,9 +1012,12 @@ app.post('/api/chat', async (c) => {
       
       console.log('[OFFICE_FILES] Code Interpreter success')
       
+      // Generate a unique response ID for conversation continuity
+      const responseId = `ci_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      
       return c.json({
         message: codeInterpreterResult.message,
-        responseId: null, // Assistants API doesn't use response IDs
+        responseId: responseId, // Generate unique ID for Code Interpreter responses
         searchUsed: false,
         fileUsed: true,
         apiUsed: 'assistants_code_interpreter',
