@@ -185,18 +185,18 @@ class ChatBot {
                 let statusText = `添付: ${responseData.filename} (${Math.round(responseData.bytes/1024)} KB) - ${responseData.fileType.toUpperCase()}`
                 
                 if (responseData.requiresCodeInterpreter) {
-                    statusText += ' ⚠️ 未対応(変換必要)'
+                    statusText += ' 🔧 Code Interpreter対応'
                 }
                 
                 this.fileStatusText.textContent = statusText
                 
-                // Show limitation warning for Office files
-                if (responseData.limitation) {
-                    console.warn('[UPLOAD] File limitation:', responseData.limitation)
+                // Show Code Interpreter ready message for Office files
+                if (responseData.codeInterpreterReady) {
+                    console.log('[UPLOAD] Code Interpreter ready for Office file')
                     
                     setTimeout(() => {
-                        const limitationMsg = `⚠️ ${responseData.limitation.issue}\n\n解決策: ${responseData.limitation.solution}\n手順: ${responseData.limitation.instructions}`
-                        alert(limitationMsg)
+                        const readyMsg = `🔧 Code Interpreterが有効です！\n\nExcelファイルのデータ分析、グラフ作成、統計処理が可能です。`
+                        alert(readyMsg)
                     }, 1000)
                 }
                 

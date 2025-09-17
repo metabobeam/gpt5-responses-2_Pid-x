@@ -427,6 +427,344 @@ async function callOnceWithModel(
   }
 }
 
+// Code Interpreter function using Assistants API for Office files
+async function callWithCodeInterpreter(
+  openaiKey: string,
+  message: string,
+  fileIds: string[]
+): Promise<{ result: any; partial: boolean; modelUsed: string; modelsTried: string[]; error?: string }> {
+  console.log(`[CODE_INTERPRETER] Starting Assistants API with ${fileIds.length} files`)
+  
+  try {
+    // Step 1: Create Assistant with Code Interpreter
+    const assistantResponse = await fetch('https://api.openai.com/v1/assistants', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      body: JSON.stringify({
+        name: 'GPT-5 Code Interpreter',
+        instructions: 'あなたは有能なAIアシスタントです。添付されたファイルを詳細に分析し、データの傾向、パターン、洞察を日本語で提供してください。ExcelやCSVファイルの場合は、データの要約、統計、可視化を行ってください。',
+        model: 'gpt-4o', // Code Interpreter is available on gpt-4o
+        tools: [{ type: 'code_interpreter' }]
+      })
+    })
+    
+    if (!assistantResponse.ok) {
+      const error = await assistantResponse.text()
+      console.error('[CODE_INTERPRETER] Assistant creation failed:', error)
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: `Assistant creation failed: ${error}`
+      }
+    }
+    
+    const assistant = await assistantResponse.json()
+    console.log('[CODE_INTERPRETER] Assistant created:', assistant.id)
+    
+    // Step 2: Create Thread
+    const threadResponse = await fetch('https://api.openai.com/v1/threads', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      body: JSON.stringify({})
+    })
+    
+    if (!threadResponse.ok) {
+      const error = await threadResponse.text()
+      console.error('[CODE_INTERPRETER] Thread creation failed:', error)
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: `Thread creation failed: ${error}`
+      }
+    }
+    
+    const thread = await threadResponse.json()
+    console.log('[CODE_INTERPRETER] Thread created:', thread.id)
+    
+    // Step 3: Add Message with file attachments
+    const attachments = fileIds.map(fileId => ({
+      file_id: fileId,
+      tools: [{ type: 'code_interpreter' }]
+    }))
+    
+    const messageResponse = await fetch(`https://api.openai.com/v1/threads/${thread.id}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      body: JSON.stringify({
+        role: 'user',
+        content: message,
+        attachments: attachments
+      })
+    })
+    
+    if (!messageResponse.ok) {
+      const error = await messageResponse.text()
+      console.error('[CODE_INTERPRETER] Message creation failed:', error)
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: `Message creation failed: ${error}`
+      }
+    }
+    
+    const messageObj = await messageResponse.json()
+    console.log('[CODE_INTERPRETER] Message added:', messageObj.id)
+    
+    // Step 4: Run Assistant
+    const runResponse = await fetch(`https://api.openai.com/v1/threads/${thread.id}/runs`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2'
+      },
+      body: JSON.stringify({
+        assistant_id: assistant.id
+      })
+    })
+    
+    if (!runResponse.ok) {
+      const error = await runResponse.text()
+      console.error('[CODE_INTERPRETER] Run creation failed:', error)
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: `Run creation failed: ${error}`
+      }
+    }
+    
+    const run = await runResponse.json()
+    console.log('[CODE_INTERPRETER] Run started:', run.id)
+    
+    // Step 5: Poll for completion with extended timeout for Code Interpreter
+    let runStatus = run.status
+    let attempts = 0
+    const maxAttempts = 90 // 180 seconds timeout (3 minutes) for Code Interpreter tasks
+    
+    while (['queued', 'in_progress', 'requires_action'].includes(runStatus) && attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 2000)) // Wait 2 seconds
+      attempts++
+      
+      const statusResponse = await fetch(`https://api.openai.com/v1/threads/${thread.id}/runs/${run.id}`, {
+        headers: {
+          'Authorization': `Bearer ${openaiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        }
+      })
+      
+      if (statusResponse.ok) {
+        const statusObj = await statusResponse.json()
+        runStatus = statusObj.status
+        console.log(`[CODE_INTERPRETER] Run status (${attempts}/${maxAttempts}): ${runStatus}`)
+        
+        // Handle requires_action status (tool calls)
+        if (runStatus === 'requires_action') {
+          console.log('[CODE_INTERPRETER] Run requires action, continuing to poll...')
+        }
+      } else {
+        console.error('[CODE_INTERPRETER] Status check failed:', await statusResponse.text())
+      }
+    }
+    
+    if (!['completed', 'failed', 'cancelled', 'expired'].includes(runStatus)) {
+      console.error('[CODE_INTERPRETER] Run timed out after polling:', runStatus)
+      
+      // Try to retrieve any partial results before failing completely
+      if (runStatus === 'in_progress' || runStatus === 'queued') {
+        console.log('[CODE_INTERPRETER] Attempting to retrieve partial results...')
+        
+        try {
+          const messagesResponse = await fetch(`https://api.openai.com/v1/threads/${thread.id}/messages`, {
+            headers: {
+              'Authorization': `Bearer ${openaiKey}`,
+              'OpenAI-Beta': 'assistants=v2'
+            }
+          })
+          
+          if (messagesResponse.ok) {
+            const messages = await messagesResponse.json()
+            const assistantMessages = messages.data.filter((msg: any) => msg.role === 'assistant')
+            
+            if (assistantMessages.length > 0) {
+              console.log('[CODE_INTERPRETER] Found partial assistant responses during timeout')
+              
+              const latestMessage = assistantMessages[0]
+              let partialText = ''
+              
+              if (Array.isArray(latestMessage.content)) {
+                for (const content of latestMessage.content) {
+                  if (content.type === 'text') {
+                    partialText += content.text.value
+                  }
+                }
+              }
+              
+              if (partialText.trim()) {
+                console.log('[CODE_INTERPRETER] Returning partial response due to timeout')
+                return {
+                  result: {
+                    message: `[部分的な応答] ${partialText}\n\n注意: 処理がタイムアウトしましたが、上記の部分的な結果が取得できました。`
+                  },
+                  partial: true,
+                  modelUsed: 'gpt-4o',
+                  modelsTried: ['gpt-4o'],
+                  error: `Partial response recovered from timeout (${runStatus})`
+                }
+              }
+            }
+          }
+        } catch (partialError) {
+          console.error('[CODE_INTERPRETER] Failed to retrieve partial results:', partialError)
+        }
+      }
+      
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: `Code Interpreter timed out after ${attempts} attempts (${Math.round(attempts * 2 / 60, 1)} minutes). Status: ${runStatus}. OpenAI APIが混雑している可能性があります。しばらく待ってから再試行してください。`
+      }
+    }
+    
+    if (runStatus !== 'completed') {
+      console.error('[CODE_INTERPRETER] Run did not complete successfully:', runStatus)
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: `Code Interpreter failed with status: ${runStatus}`
+      }
+    }
+    
+    // Step 6: Get Messages
+    const messagesResponse = await fetch(`https://api.openai.com/v1/threads/${thread.id}/messages`, {
+      headers: {
+        'Authorization': `Bearer ${openaiKey}`,
+        'OpenAI-Beta': 'assistants=v2'
+      }
+    })
+    
+    if (!messagesResponse.ok) {
+      const error = await messagesResponse.text()
+      console.error('[CODE_INTERPRETER] Messages retrieval failed:', error)
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: `Messages retrieval failed: ${error}`
+      }
+    }
+    
+    const messages = await messagesResponse.json()
+    console.log('[CODE_INTERPRETER] Retrieved messages:', messages.data.length)
+    
+    // Find the assistant's response
+    const assistantMessages = messages.data.filter((msg: any) => msg.role === 'assistant')
+    
+    if (assistantMessages.length === 0) {
+      console.error('[CODE_INTERPRETER] No assistant messages found in thread')
+      console.log('[CODE_INTERPRETER] Available messages:', messages.data.map((m: any) => ({ role: m.role, id: m.id })))
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: 'No assistant response found in thread'
+      }
+    }
+    
+    console.log('[CODE_INTERPRETER] Found', assistantMessages.length, 'assistant messages')
+    
+    // Get the latest assistant message (first in the sorted list)
+    const latestMessage = assistantMessages[0]
+    let responseText = ''
+    
+    // Extract text content from message
+    if (Array.isArray(latestMessage.content)) {
+      for (const content of latestMessage.content) {
+        if (content.type === 'text') {
+          responseText += content.text.value
+        } else {
+          console.log('[CODE_INTERPRETER] Found non-text content:', content.type)
+        }
+      }
+    } else {
+      console.warn('[CODE_INTERPRETER] Unexpected message content format:', typeof latestMessage.content)
+    }
+    
+    console.log('[CODE_INTERPRETER] Extracted response text length:', responseText.length)
+    
+    if (!responseText.trim()) {
+      console.error('[CODE_INTERPRETER] Empty response text extracted')
+      return {
+        result: null,
+        partial: false,
+        modelUsed: 'gpt-4o',
+        modelsTried: ['gpt-4o'],
+        error: 'Empty response from Code Interpreter'
+      }
+    }
+    
+    // Step 7: Cleanup (delete assistant and thread)
+    try {
+      await fetch(`https://api.openai.com/v1/assistants/${assistant.id}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${openaiKey}`,
+          'OpenAI-Beta': 'assistants=v2'
+        }
+      })
+      console.log('[CODE_INTERPRETER] Assistant cleaned up')
+    } catch (error) {
+      console.warn('[CODE_INTERPRETER] Assistant cleanup failed:', error)
+    }
+    
+    return {
+      result: {
+        message: responseText,
+        thread_id: thread.id,
+        run_id: run.id
+      },
+      partial: false,
+      modelUsed: 'gpt-4o',
+      modelsTried: ['gpt-4o']
+    }
+    
+  } catch (error) {
+    console.error('[CODE_INTERPRETER] Unexpected error:', error)
+    return {
+      result: null,
+      partial: false,
+      modelUsed: 'gpt-4o',
+      modelsTried: ['gpt-4o'],
+      error: error.toString()
+    }
+  }
+}
+
 // GPT-5 only function: No fallback to other models
 async function callWithGPT5Only(
   openaiKey: string,
@@ -580,8 +918,12 @@ app.post('/api/chat', async (c) => {
       })
     }
     
-    // Note: Code Interpreter tool removed since we're blocking Excel files
-    // Excel files are not supported by Responses API and will be rejected before this point
+    // Web search tool for Responses API (Office files handled separately above)
+    if (useSearch) {
+      tools.push({
+        type: 'web_search'
+      })
+    }
 
     // Note: analyze_file tool removed - requires tool output submit implementation
     // Files are now handled via input_file format directly in messages
@@ -600,18 +942,56 @@ app.post('/api/chat', async (c) => {
     const hasFiles = (Array.isArray(fileIds) && fileIds.length > 0) || 
                      (fileContent && typeof fileContent === 'string' && fileContent.trim())
     
-    // Check if user is trying to use Excel files (not supported by Responses API)
+    // Check if user has Office files - use Code Interpreter via Assistants API
     if (Array.isArray(fileIds) && fileIds.length > 0) {
+      console.log('[OFFICE_FILES] Detected Office files, using Code Interpreter via Assistants API')
+      
+      const { 
+        result: codeInterpreterResult, 
+        partial, 
+        modelUsed, 
+        modelsTried, 
+        error: codeInterpreterError 
+      } = await callWithCodeInterpreter(openaiKey, message, fileIds)
+      
+      if (!codeInterpreterResult) {
+        console.error('[OFFICE_FILES] Code Interpreter failed:', codeInterpreterError)
+        
+        return c.json({ 
+          error: 'Code Interpreter failed', 
+          details: codeInterpreterError,
+          message: `Code Interpreterでエラーが発生しました。`,
+          suggestion: 'ファイルが破損していないか確認し、再度アップロードしてください。',
+          diagnostic: {
+            modelRequested: model,
+            modelsTried,
+            modelUsed,
+            partial,
+            fallbackUsed: false,
+            apiUsed: 'assistants_code_interpreter'
+          }
+        }, 500)
+      }
+      
+      console.log('[OFFICE_FILES] Code Interpreter success')
+      
       return c.json({
-        error: 'Excel files not supported',
-        message: 'Responses APIはExcelファイル（.xlsx, .xls）を直接サポートしていません。',
-        suggestion: 'ExcelファイルをCSV形式またはPDF形式で保存し直してからアップロードしてください。',
-        instructions: {
-          csv: 'Excelでファイルを開き、「名前を付けて保存」→「CSV(カンマ区切り)」で保存',
-          pdf: 'Excelでファイルを開き、「エクスポート」→「PDF」で保存'
-        },
-        supportedAlternatives: ['.csv', '.pdf', '.txt']
-      }, 400)
+        message: codeInterpreterResult.message,
+        responseId: null, // Assistants API doesn't use response IDs
+        searchUsed: false,
+        fileUsed: true,
+        apiUsed: 'assistants_code_interpreter',
+        attachmentsSeen: fileIds.length,
+        receivedFileIds: fileIds.length,
+        diagnostic: {
+          modelRequested: model,
+          modelUsed,
+          modelsTried,
+          partial,
+          fallbackUsed: model !== modelUsed,
+          apiUsed: 'assistants_code_interpreter'
+        }
+      })
     }
     
     if (hasFiles) {
@@ -896,15 +1276,10 @@ app.post('/api/upload', async (c) => {
         fileType: fileType,
         requiresCodeInterpreter: fileType === 'office',
         message: fileType === 'office' 
-          ? '⚠️ Office file uploaded but cannot be processed directly. Please convert to CSV or PDF format for analysis.' 
+          ? '✅ Office file uploaded successfully! Will use Code Interpreter for analysis.' 
           : 'File uploaded to OpenAI successfully',
-        limitation: fileType === 'office' 
-          ? {
-            issue: 'Responses API does not support Excel files directly',
-            solution: 'Convert Excel to CSV (for data) or PDF (for formatting)',
-            instructions: 'Excel → Save As → CSV (Comma delimited) or Export → PDF'
-          } 
-          : null
+        codeInterpreterReady: fileType === 'office',
+        apiMethod: fileType === 'office' ? 'assistants_code_interpreter' : 'responses'
       })
     }
 
@@ -1117,7 +1492,7 @@ app.get('/', (c) => {
                             <p class="text-sm mt-1">Web検索とファイルアップロード機能が利用できます。</p>
                             <p class="text-xs mt-1 text-gray-400">
                                 <i class="fas fa-file mr-1"></i>
-                                対応形式: PDF, Office(.xlsx,.docx,.pptx), テキスト(.txt,.md,.csv), 画像(.png,.jpg,.jpeg,.gif,.webp)
+                                対応形式: Office(.xlsx,.docx,.pptx) 🔧 Code Interpreter, PDF, テキスト(.txt,.md,.csv), 画像(.png,.jpg,.jpeg,.gif,.webp)
                             </p>
                             <p class="text-xs mt-2 text-purple-600">
                                 <i class="fas fa-magic mr-1"></i>
